@@ -9,6 +9,39 @@ window.__ModuleLoader__.load({
     const useRef = React.useRef
     const useMemo = React.useMemo
 
+    /*
+     * Optional host primitive: the "original format" view of a Markdown document renders through
+     * the platform's own Markdown component, so it looks exactly like the built-in preview. The
+     * module id is a platform seed word (the same one dshmarket and modlens require); the request
+     * is guarded so the plugin still loads — with the raw-source view only — on a host that does
+     * not expose it.
+     */
+    let hostMarkdownText = null
+    try {
+      const hostPrimitives = require('@deepseek-ai/dsh-client-ui-primitives')
+      if (hostPrimitives && typeof hostPrimitives.MarkdownText === 'function') hostMarkdownText = hostPrimitives.MarkdownText
+    } catch (error) {
+      hostMarkdownText = null
+    }
+
+    /**
+     * Error boundary around the host Markdown renderer: a host-side render failure must degrade to
+     * the verbatim source instead of blanking the panel.
+     */
+    const MarkdownBoundaryBase = React && typeof React.Component === 'function' ? React.Component : function () {}
+    class HostMarkdownBoundary extends MarkdownBoundaryBase {
+      constructor(props) {
+        super(props)
+        this.state = { failed: false }
+      }
+      static getDerivedStateFromError() {
+        return { failed: true }
+      }
+      render() {
+        return this.state.failed ? this.props.fallback : this.props.children
+      }
+    }
+
     const TOOL_KEYS = ['view_xmind', 'markdown_to_mindmap', 'edit_mindmap_node', 'xmind_to_markdown']
     const LOCALE_NAMESPACE = 'xmind'
     const MIN_ZOOM = 0.3
@@ -404,8 +437,11 @@ window.__ModuleLoader__.load({
     /* ------------------- sidebar preview: XMind parsing ------------------- */
 
     const PREVIEW_ID = 'dsh-xmind-mindmap.preview'
+    const MARKDOWN_PREVIEW_ID = 'dsh-xmind-mindmap.preview.markdown'
     const PREVIEW_MAX_BYTES = 64 * 1024 * 1024
     const PREVIEW_MAX_NODES = 5000
+    /** Beyond this size a Markdown file is not turned into a mindmap in the sidebar. */
+    const MARKDOWN_MAX_BYTES = 8 * 1024 * 1024
 
     function previewBytesOf(content) {
       if (!content || typeof content !== 'object' || content.kind !== 'bytes') return null
@@ -417,6 +453,16 @@ window.__ModuleLoader__.load({
 
     function decodeUtf8(bytes) {
       return new TextDecoder('utf-8').decode(bytes)
+    }
+
+    /**
+     * Text of a `text-pages` preview body; `null` for any other loading mode.
+     * @param {{kind?: string, text?: string}} content
+     * @returns {string|null}
+     */
+    function previewTextOf(content) {
+      if (!content || typeof content !== 'object' || content.kind !== 'text') return null
+      return typeof content.text === 'string' ? content.text : ''
     }
 
     function u16(bytes, offset) {
@@ -811,6 +857,459 @@ window.__ModuleLoader__.load({
       return ''
     }
 
+    /**
+     * Build the chat-card payload for a Markdown document rendered as a mindmap.
+     * @param {string} markdown document text
+     * @param {string} sourcePath path used for the fallback root title
+     * @returns {object} payload in the same shape as {@link previewPayload}
+     */
+    function markdownPreviewPayload(markdown, sourcePath) {
+      const text = typeof markdown === 'string' ? markdown : ''
+      let parsed
+      try {
+        parsed = parseMarkdownText(text, { fileName: baseName(sourcePath) })
+      } catch (error) {
+        parsed = { root: { id: 'md-1', title: 'Untitled', children: { attached: [] } }, warnings: [] }
+      }
+      const warnings = Array.isArray(parsed.warnings) ? parsed.warnings.slice() : []
+      return {
+        v: 1,
+        kind: 'tree',
+        sourcePath: sourcePath || '',
+        format: 'markdown',
+        sheetTitle: '',
+        sheetCount: 0,
+        sheetIndex: 0,
+        rootTopic: parsed.root || null,
+        mermaid: '',
+        warnings: warnings,
+      }
+    }
+
+    /* ------- sidebar preview: Markdown -> tree (mirror of lib/markdown.js) ------- *
+     * The client bundle cannot import host modules, so `parseMarkdownText` below is a
+     * verbatim mirror of `parseMarkdown` in lib/markdown.js (only identifiers are
+     * prefixed). test/preview.test.js cross-checks both implementations on the same
+     * sources, so any behaviour change must be applied to both files.
+     */
+    const MD_UNSUPPORTED_MARKER = '该内容类型暂不支持 XMind 结构映射:'
+    const MD_EMPTY_WARNING = '文件为空或只包含空白字符'
+
+    const MD_KIND_TITLES = {
+      code: '代码块',
+      table: '表格',
+      image: '图片',
+      blockquote: '引用块',
+    }
+
+    /** `# ATX` heading; more than 6 hashes is tolerated for XMind-origin depth recovery. */
+    const MD_HEADING_RE = /^ {0,3}(#{1,})\s+(.*)$/
+    /** Exactly one `#` at the start of the line: the document root candidate. */
+    const MD_ROOT_HEADING_RE = /^ {0,3}#\s+(.*)$/
+    const MD_LIST_RE = /^([ \t]*)([-*+]|\d{1,9}[.)])[ \t]+(.*)$/
+    const MD_LIST_EMPTY_RE = /^([ \t]*)([-*+]|\d{1,9}[.)])[ \t]*$/
+    const MD_FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/
+    const MD_BLOCKQUOTE_RE = /^ {0,3}>/
+    const MD_IMAGE_ONLY_RE = /^ {0,3}!\[[^\]]*\]\([^)]*\)\s*$/
+    const MD_TABLE_DELIMITER_RE = /^ {0,3}\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/
+
+    /** @param {unknown} value */
+    function mdIsPlainObject(value) {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+      const proto = Object.getPrototypeOf(value)
+      return proto === Object.prototype || proto === null
+    }
+
+    /** @param {unknown} value */
+    function mdNonEmptyString(value) {
+      return typeof value === 'string' && value.trim() !== ''
+    }
+
+    /**
+     * Collapse a single line to display text.
+     * @param {string} text
+     * @returns {string}
+     */
+    function mdCollapseWhitespace(text) {
+      return String(text).replace(/\s+/g, ' ').trim()
+    }
+
+    /**
+     * File-name stem used as the synthetic root title.
+     * @param {unknown} fileName
+     * @returns {string}
+     */
+    function mdTitleFromFileName(fileName) {
+      if (!mdNonEmptyString(fileName)) return 'Untitled'
+      const base = String(fileName)
+        .replace(/\\/g, '/')
+        .split('/')
+        .pop()
+      const dot = base.lastIndexOf('.')
+      const stem = dot > 0 ? base.slice(0, dot) : base
+      return stem.trim() || 'Untitled'
+    }
+
+    /**
+     * Strip a trailing ATX closing sequence (`## Title ##`).
+     * @param {string} text
+     * @returns {string}
+     */
+    function mdStripClosingHashes(text) {
+      return text.replace(/\s+#+\s*$/, '').trim()
+    }
+
+    /**
+     * If the text is exactly one Markdown link `[title](url)`, split it; otherwise keep it literal.
+     * @param {string} text
+     * @returns {{title: string, href?: string}}
+     */
+    function mdExtractLink(text) {
+      const trimmed = String(text).trim()
+      const match = /^\[([^\]]*)\]\(([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)$/.exec(trimmed)
+      if (match && match[2].trim() !== '') {
+        return { title: match[1].trim() || 'Untitled', href: match[2].trim() }
+      }
+      return { title: trimmed || 'Untitled' }
+    }
+
+    /**
+     * Normalize a paragraph's raw lines into stable text (trailing spaces dropped, outer blank lines removed).
+     * @param {string[]} lines
+     * @returns {string}
+     */
+    function mdCleanParagraph(lines) {
+      return lines
+        .map((line) => line.replace(/[ \t]+$/, ''))
+        .join('\n')
+        .replace(/^\n+|\n+$/g, '')
+        .trim()
+    }
+
+    /**
+     * Append one paragraph/block to a node's notes, separated by a blank line.
+     * @param {object} node
+     * @param {string} text
+     */
+    function mdAppendToNotes(node, text) {
+      if (!text) return
+      const existing = typeof node.notes === 'string' ? node.notes : ''
+      node.notes = existing ? `${existing}\n\n${text}` : text
+    }
+
+    /**
+     * @param {string[]} lines
+     * @param {number} index
+     * @returns {boolean} whether a new block starts at this line
+     */
+    function mdIsTableStart(lines, index) {
+      const header = lines[index]
+      if (typeof header !== 'string' || !header.includes('|')) return false
+      const delimiter = lines[index + 1]
+      if (typeof delimiter !== 'string' || !delimiter.includes('|')) return false
+      return MD_TABLE_DELIMITER_RE.test(delimiter)
+    }
+
+    /**
+     * @param {string[]} lines
+     * @param {number} index
+     * @returns {boolean}
+     */
+    function mdStartsBlock(lines, index) {
+      const line = lines[index]
+      if (typeof line !== 'string' || line.trim() === '') return true
+      if (MD_HEADING_RE.test(line)) return true
+      if (MD_FENCE_RE.test(line)) return true
+      if (MD_LIST_RE.test(line) || MD_LIST_EMPTY_RE.test(line)) return true
+      if (MD_BLOCKQUOTE_RE.test(line)) return true
+      if (MD_IMAGE_ONLY_RE.test(line)) return true
+      if (mdIsTableStart(lines, index)) return true
+      return false
+    }
+
+    /**
+     * @param {string} line
+     * @param {string} fenceCharacter
+     * @param {number} fenceLength
+     * @returns {boolean}
+     */
+    function mdIsClosingFence(line, fenceCharacter, fenceLength) {
+      const match = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line)
+      return Boolean(match) && match[1][0] === fenceCharacter && match[1].length >= fenceLength
+    }
+
+    /**
+     * Parse Markdown into the canonical tree schema (CONTRACT section 3).
+     * Never throws for malformed content; degradations append Chinese warnings.
+     * @param {string} markdown
+     * @param {{fileName?: string, warnings?: string[]}} [opts]
+     * @returns {{root: object, warnings: string[]}}
+     */
+    function parseMarkdownText(markdown, opts = {}) {
+      const warnings = Array.isArray(opts.warnings) ? opts.warnings : []
+      const source = typeof markdown === 'string' ? markdown.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n') : ''
+      const lines = source.split('\n')
+
+      let rootTitle = mdTitleFromFileName(opts.fileName)
+      let rootHref
+      let rootLineIndex = -1
+      for (let index = 0; index < lines.length; index += 1) {
+        const match = MD_ROOT_HEADING_RE.exec(lines[index])
+        if (!match) continue
+        const parsed = mdExtractLink(mdStripClosingHashes(match[1]))
+        rootTitle = parsed.title
+        rootHref = parsed.href
+        rootLineIndex = index
+        break
+      }
+
+      const root = { id: 'md-1', title: rootTitle, children: { attached: [] } }
+      if (rootHref) root.href = rootHref
+
+      if (source.trim() === '') {
+        warnings.push(MD_EMPTY_WARNING)
+        return { root, warnings }
+      }
+
+      let nextId = 2
+      /** @returns {string} */
+      function allocateId() {
+        const id = `md-${nextId}`
+        nextId += 1
+        return id
+      }
+
+      /**
+       * @param {string} text
+       * @returns {object}
+       */
+      function createNodeFromText(text) {
+        const parsed = mdExtractLink(text)
+        const node = { id: allocateId(), title: parsed.title, children: { attached: [] } }
+        if (parsed.href) node.href = parsed.href
+        return node
+      }
+
+      let lastStructural = null
+      let currentHeading = { node: root, depth: 1 }
+      let headingStack = [{ level: 1, node: root, depth: 1 }]
+      let listStack = []
+      let indentUnit = null
+      let indentWarned = false
+      let sawSpaceIndent = false
+      let sawTabIndent = false
+
+      /**
+       * @param {string} whitespace
+       * @param {number} lineNumber
+       */
+      function noteIndentation(whitespace, lineNumber) {
+        if (!whitespace) return
+        if (whitespace.includes(' ')) sawSpaceIndent = true
+        if (whitespace.includes('\t')) sawTabIndent = true
+        if (indentUnit === null) indentUnit = whitespace.includes('\t') ? '\t' : '  '
+        if (sawSpaceIndent && sawTabIndent && !indentWarned) {
+          indentWarned = true
+          warnings.push(`第 ${lineNumber} 行：列表缩进混用空格与 Tab，已按首次出现的缩进单位解析`)
+        }
+      }
+
+      /**
+       * @param {string} whitespace
+       * @returns {number}
+       */
+      function indentationLevel(whitespace) {
+        if (!whitespace) return 0
+        if (indentUnit === '\t') {
+          const tabs = (whitespace.match(/\t/g) || []).length
+          const spaces = (whitespace.match(/ /g) || []).length
+          return tabs + Math.floor(spaces / 2)
+        }
+        return Math.floor(whitespace.replace(/\t/g, '  ').length / 2)
+      }
+
+      /**
+       * @param {string} kind
+       * @param {string} raw
+       * @param {number} lineNumber
+       */
+      function degrade(kind, raw, lineNumber) {
+        const title = MD_KIND_TITLES[kind] || kind
+        if (lastStructural) {
+          mdAppendToNotes(lastStructural, `${MD_UNSUPPORTED_MARKER}\n${raw}`)
+        } else {
+          const node = { id: allocateId(), title, children: { attached: [] }, notes: raw }
+          root.children.attached.push(node)
+        }
+        warnings.push(`第 ${lineNumber} 行：暂不支持${title}，已降级为备注`)
+      }
+
+      /**
+       * @param {string} hashes
+       * @param {string} rawText
+       */
+      function handleHeading(hashes, rawText) {
+        const level = hashes.length
+        const node = createNodeFromText(mdStripClosingHashes(rawText))
+
+        if (level === 1) {
+          // A later level-1 heading is a child of the root, never the root itself.
+          root.children.attached.push(node)
+          headingStack = [
+            { level: 1, node: root, depth: 1 },
+            { level: 1, node, depth: 2 },
+          ]
+          currentHeading = { node, depth: 2 }
+          listStack = []
+          lastStructural = node
+          return
+        }
+
+        while (headingStack.length > 1) {
+          const top = headingStack[headingStack.length - 1]
+          if (top.depth >= level || top.level >= level) headingStack.pop()
+          else break
+        }
+        const parentEntry = headingStack[headingStack.length - 1]
+        let depth
+        if (level > 6) {
+          const levelSix = [...headingStack].reverse().find((entry) => entry.level === 6)
+          depth = levelSix ? Math.max(level, levelSix.depth + (level - 6)) : parentEntry.depth + 1
+        } else {
+          depth = Math.min(level, parentEntry.depth + 1)
+        }
+        depth = Math.min(depth, MAX_DEPTH)
+
+        parentEntry.node.children.attached.push(node)
+        headingStack.push({ level, node, depth })
+        currentHeading = { node, depth }
+        listStack = []
+        lastStructural = node
+      }
+
+      /**
+       * @param {RegExpExecArray} match
+       * @param {number} lineNumber
+       */
+      function handleListItem(match, lineNumber) {
+        const whitespace = match[1] || ''
+        noteIndentation(whitespace, lineNumber)
+        const indentLevel = indentationLevel(whitespace)
+        while (listStack.length > 0 && listStack[listStack.length - 1].indentLevel >= indentLevel) {
+          listStack.pop()
+        }
+
+        let parent
+        let depth
+        if (listStack.length > 0) {
+          const top = listStack[listStack.length - 1]
+          parent = top.node
+          depth = top.depth + 1
+        } else {
+          parent = currentHeading.node
+          depth = currentHeading.depth + 1
+        }
+
+        const node = createNodeFromText(match[3] || '')
+        parent.children.attached.push(node)
+        listStack.push({ node, indentLevel, depth: Math.min(depth, MAX_DEPTH) })
+        lastStructural = node
+      }
+
+      let index = 0
+      while (index < lines.length) {
+        const line = lines[index]
+
+        if (line.trim() === '') {
+          index += 1
+          continue
+        }
+
+        const fence = MD_FENCE_RE.exec(line)
+        if (fence) {
+          const character = fence[1][0]
+          const length = fence[1].length
+          let end = index + 1
+          let closed = false
+          while (end < lines.length) {
+            if (mdIsClosingFence(lines[end], character, length)) {
+              closed = true
+              break
+            }
+            end += 1
+          }
+          const stop = closed ? end + 1 : Math.min(end, lines.length)
+          degrade('code', lines.slice(index, stop).join('\n'), index + 1)
+          index = stop
+          continue
+        }
+
+        const heading = MD_HEADING_RE.exec(line)
+        if (heading) {
+          if (index === rootLineIndex) {
+            currentHeading = { node: root, depth: 1 }
+            headingStack = [{ level: 1, node: root, depth: 1 }]
+            listStack = []
+            lastStructural = root
+          } else {
+            handleHeading(heading[1], heading[2])
+          }
+          index += 1
+          continue
+        }
+
+        const listItem = MD_LIST_RE.exec(line) || MD_LIST_EMPTY_RE.exec(line)
+        if (listItem) {
+          handleListItem(listItem, index + 1)
+          index += 1
+          continue
+        }
+
+        if (MD_BLOCKQUOTE_RE.test(line)) {
+          let end = index + 1
+          while (end < lines.length && MD_BLOCKQUOTE_RE.test(lines[end])) end += 1
+          degrade('blockquote', lines.slice(index, end).join('\n'), index + 1)
+          index = end
+          continue
+        }
+
+        if (MD_IMAGE_ONLY_RE.test(line)) {
+          let end = index + 1
+          while (end < lines.length && MD_IMAGE_ONLY_RE.test(lines[end])) end += 1
+          degrade('image', lines.slice(index, end).join('\n'), index + 1)
+          index = end
+          continue
+        }
+
+        if (mdIsTableStart(lines, index)) {
+          let end = index + 2
+          while (end < lines.length && lines[end].trim() !== '' && lines[end].includes('|')) end += 1
+          degrade('table', lines.slice(index, end).join('\n'), index + 1)
+          index = end
+          continue
+        }
+
+        // Paragraph: consume until the next blank line or block starter.
+        let end = index + 1
+        while (end < lines.length && !mdStartsBlock(lines, end)) end += 1
+        const paragraphLines = lines.slice(index, end)
+        const text = mdCleanParagraph(paragraphLines)
+        if (text) {
+          if (lastStructural) {
+            mdAppendToNotes(lastStructural, text)
+          } else {
+            const firstLine = mdCollapseWhitespace(paragraphLines[0] || '')
+            const title = Array.from(firstLine).slice(0, 80).join('') || 'Untitled'
+            const node = { id: allocateId(), title, children: { attached: [] }, notes: text }
+            root.children.attached.push(node)
+          }
+        }
+        index = end
+      }
+
+      return { root, warnings }
+    }
+
     function previewStyles() {
       return {
         root: { height: '100%', minHeight: 0, display: 'flex', flexDirection: 'column' },
@@ -846,6 +1345,60 @@ window.__ModuleLoader__.load({
           borderRadius: 6,
           padding: '3px 6px',
           maxWidth: 240,
+        },
+        viewBar: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          padding: '6px 10px',
+          borderBottom: '1px solid var(--dsw-alias-border-l1, #eef0f3)',
+          background: 'var(--dsw-alias-bg-layer-1, #ffffff)',
+          flex: '0 0 auto',
+        },
+        viewButton: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          height: 24,
+          padding: '0 10px',
+          border: '1px solid var(--dsw-alias-border-l2, #e4e6eb)',
+          borderRadius: 6,
+          background: 'var(--dsw-alias-bg-layer-1, #ffffff)',
+          color: 'var(--dsw-alias-label-secondary, #6b7280)',
+          font: 'inherit',
+          fontSize: 12,
+          lineHeight: 1,
+          cursor: 'pointer',
+        },
+        viewButtonActive: {
+          background: 'var(--dsw-alias-interactive-bg-active, #e8edff)',
+          borderColor: 'var(--dsw-alias-brand-primary, #4d6bfe)',
+          color: 'var(--dsw-alias-brand-primary, #4d6bfe)',
+        },
+        sourceScroll: {
+          flex: '1 1 auto',
+          minHeight: 0,
+          overflow: 'auto',
+          padding: '10px 14px',
+          background: 'var(--dsw-alias-bg-layer-1, #ffffff)',
+          color: 'var(--dsw-alias-label-primary, #1f2328)',
+          fontSize: 13,
+          lineHeight: 1.65,
+          wordBreak: 'break-word',
+        },
+        sourcePre: {
+          margin: 0,
+          flex: '1 1 auto',
+          minHeight: 0,
+          overflow: 'auto',
+          padding: '10px 12px',
+          background: 'var(--dsw-alias-bg-layer-1, #ffffff)',
+          color: 'var(--dsw-alias-label-primary, #1f2328)',
+          fontFamily: 'ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace',
+          fontSize: 12,
+          lineHeight: 1.6,
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
         },
       }
     }
@@ -935,6 +1488,183 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * Text of a preview body regardless of loading mode: `bytes-complete` bytes are
+     * decoded as UTF-8, `text-pages` pages are used verbatim.
+     * @param {object} content
+     * @returns {{status: 'empty'|'too-large'|'ok', text: string}}
+     */
+    function previewDocumentText(content) {
+      // `bytes-complete` hands the body no content at all until the file is read; treat that as
+      // "nothing to show yet" rather than guessing at a file that has not arrived.
+      if (content === undefined || content === null) return { status: 'empty', text: '' }
+      const bytes = previewBytesOf(content)
+      if (bytes) {
+        if (bytes.length > MARKDOWN_MAX_BYTES) return { status: 'too-large', text: '' }
+        try {
+          return { status: 'ok', text: decodeUtf8(bytes) }
+        } catch (error) {
+          return { status: 'empty', text: '' }
+        }
+      }
+      const text = previewTextOf(content)
+      if (text === null) return { status: 'empty', text: '' }
+      return { status: 'ok', text: text }
+    }
+
+    /** View labels of the Markdown preview: the mindmap, or the file's own Markdown source. */
+    const MARKDOWN_VIEWS = {
+      MAP: 'map',
+      SOURCE: 'source',
+    }
+
+    /**
+     * Last view chosen per document path, so closing and reopening a tab keeps the reading mode.
+     * In-memory only: the client card may not touch storage, and a session-scoped panel keeps the
+     * whole session's paths comfortably small.
+     */
+    const MARKDOWN_VIEW_MEMORY = new Map()
+
+    /** @param {string} key @param {string} view */
+    function rememberMarkdownView(key, view) {
+      if (!key) return
+      if (MARKDOWN_VIEW_MEMORY.size > 50 && !MARKDOWN_VIEW_MEMORY.has(key)) MARKDOWN_VIEW_MEMORY.clear()
+      MARKDOWN_VIEW_MEMORY.set(key, view)
+    }
+
+    /**
+     * Primitive-level labels the host Markdown component asks for (code-block chrome, footnotes).
+     * Supplied from this plugin's own dictionary so the host renderer stays language-consistent
+     * with the rest of the card without reaching into another locale namespace.
+     * @param {(key: string) => string} tr
+     */
+    function hostMarkdownLabels(tr) {
+      return {
+        code: {
+          copyLabel: tr('preview.mdCodeCopy'),
+          copiedLabel: tr('preview.mdCodeCopied'),
+          toolbarLabels: {
+            codeLabel: tr('preview.mdCodeLabel'),
+            wrapLabel: tr('preview.mdCodeWrap'),
+            unwrapLabel: tr('preview.mdCodeUnwrap'),
+          },
+        },
+        footnotes: tr('preview.mdFootnotes'),
+      }
+    }
+
+    /**
+     * "Original format" view: the file's own Markdown, rendered. When the host exposes its
+     * Markdown primitive the pane looks exactly like the built-in `.md` preview; otherwise (or if
+     * that renderer ever throws) the verbatim source stands in, so the view is never empty.
+     * @param {string} text @param {object} styles @param {(key: string) => string} tr
+     */
+    function renderSourceView(text, styles, tr) {
+      const verbatim = h(
+        'pre',
+        { style: styles.sourcePre, 'aria-label': tr('preview.markdownViewSource'), tabIndex: 0 },
+        text
+      )
+      if (!hostMarkdownText) return verbatim
+      return h(
+        'div',
+        { key: 'md-source-scroll', style: styles.sourceScroll },
+        h(
+          HostMarkdownBoundary,
+          { key: 'md-source-boundary', fallback: verbatim },
+          h(hostMarkdownText, { key: 'md-source', text: text, labels: hostMarkdownLabels(tr), streaming: false, variant: 'body' })
+        )
+      )
+    }
+
+    /**
+     * Right Sidebar document body for `.md` / `.markdown` files.
+     *
+     * Both views live in this one body so the pane itself offers the choice: the mindmap view
+     * named after the original request, and the file's own Markdown rendered as Markdown.
+     * Switching renderers in the host header dropdown still works (the host's builtin Markdown
+     * renderer stays a candidate), but that entry point is easy to miss, so the toggle lives here.
+     */
+    function MarkdownPreviewBody(props) {
+      const safe = props && typeof props === 'object' ? props : {}
+      const tr = makeT(safe.t)
+      const styles = previewStyles()
+      const sourcePath = previewSourcePath(safe.resourceAddress)
+      const document = previewDocumentText(safe.content)
+      const [view, setViewState] = useState(MARKDOWN_VIEW_MEMORY.get(sourcePath) || MARKDOWN_VIEWS.MAP)
+      const setView = function (next) {
+        rememberMarkdownView(sourcePath, next)
+        setViewState(next)
+      }
+      const payload = useMemo(
+        function () {
+          return document.status === 'ok' ? markdownPreviewPayload(document.text, sourcePath) : null
+        },
+        [document.status, document.text, sourcePath]
+      )
+
+      if (document.status === 'too-large') {
+        return h('div', { style: styles.center }, h('div', { style: styles.muted }, tr('preview.markdownTooLarge')))
+      }
+      if (document.status === 'empty') {
+        return h('div', { style: styles.center }, h('div', { style: styles.muted }, tr('preview.noBytes')))
+      }
+      if (!document.text.trim()) {
+        return h('div', { style: styles.center }, h('div', { style: styles.muted }, tr('preview.markdownEmpty')))
+      }
+
+      const viewButton = function (key, label, hint) {
+        const active = view === key
+        return h(
+          'button',
+          {
+            type: 'button',
+            key: 'md-view-' + key,
+            'aria-label': label,
+            'aria-pressed': active ? 'true' : 'false',
+            title: hint || label,
+            onClick: function () {
+              setView(key)
+            },
+            style: active ? merge(styles.viewButton, styles.viewButtonActive) : styles.viewButton,
+          },
+          label
+        )
+      }
+
+      const viewBar = h(
+        'div',
+        { style: styles.viewBar, role: 'toolbar', 'aria-label': tr('preview.markdownViews') },
+        viewButton(MARKDOWN_VIEWS.MAP, tr('preview.markdownViewMap'), tr('preview.markdownViewMapHint')),
+        viewButton(MARKDOWN_VIEWS.SOURCE, tr('preview.markdownViewSource'), tr('preview.markdownViewSourceHint'))
+      )
+
+      if (view === MARKDOWN_VIEWS.SOURCE) {
+        return h(
+          'div',
+          { style: styles.root },
+          viewBar,
+          renderSourceView(document.text, styles, tr)
+        )
+      }
+
+      if (!payload || !payload.rootTopic) {
+        return h(
+          'div',
+          { style: styles.root },
+          viewBar,
+          h('div', { style: styles.center }, h('div', { style: styles.muted }, tr('preview.markdownFailed')))
+        )
+      }
+
+      return h(
+        'div',
+        { style: styles.root },
+        viewBar,
+        h(MindmapCard, { key: 'markdown-preview', variant: 'preview', block: { meta: payload }, t: safe.t })
+      )
+    }
+
     /* --------------------------- locale --------------------------- */
 
     const ZH = {
@@ -976,6 +1706,21 @@ window.__ModuleLoader__.load({
       'preview.hint': '请确认文件是完整的 XMind 2020+（content.json）或 XMind 8（content.xml）工作簿。',
       'preview.noBytes': '没有读取到文件内容，可以点击标题栏的刷新重新读取。',
       'preview.sheet': 'Sheet',
+      'preview.markdownTitle': 'Markdown 导图',
+      'preview.markdownEmpty': '这个 Markdown 文件没有可映射为导图的内容。',
+      'preview.markdownTooLarge': 'Markdown 文件过大，暂不在侧边栏生成导图。',
+      'preview.markdownFailed': '无法把这个 Markdown 解析为导图',
+      'preview.markdownViews': '浏览方式',
+      'preview.markdownViewMap': '导图',
+      'preview.markdownViewSource': '原文',
+      'preview.markdownViewMapHint': '把 Markdown 映射成 XMind 导图浏览',
+      'preview.markdownViewSourceHint': '按文件原本的 Markdown 格式浏览',
+      'preview.mdCodeCopy': '复制',
+      'preview.mdCodeCopied': '已复制',
+      'preview.mdCodeLabel': '代码',
+      'preview.mdCodeWrap': '自动换行',
+      'preview.mdCodeUnwrap': '取消换行',
+      'preview.mdFootnotes': '脚注',
     }
 
     const EN = {
@@ -1017,6 +1762,21 @@ window.__ModuleLoader__.load({
       'preview.hint': 'Make sure it is a complete XMind 2020+ (content.json) or XMind 8 (content.xml) workbook.',
       'preview.noBytes': 'No file bytes were read. Use reload in the header to read the file again.',
       'preview.sheet': 'Sheet',
+      'preview.markdownTitle': 'Markdown mindmap',
+      'preview.markdownEmpty': 'This Markdown file has no content that maps to a mindmap.',
+      'preview.markdownTooLarge': 'This Markdown file is too large to render as a mindmap in the sidebar.',
+      'preview.markdownFailed': 'This Markdown cannot be parsed into a mindmap',
+      'preview.markdownViews': 'View',
+      'preview.markdownViewMap': 'Mindmap',
+      'preview.markdownViewSource': 'Source',
+      'preview.markdownViewMapHint': 'Read the Markdown as an XMind mindmap',
+      'preview.markdownViewSourceHint': 'Read the file in its original Markdown format',
+      'preview.mdCodeCopy': 'Copy',
+      'preview.mdCodeCopied': 'Copied',
+      'preview.mdCodeLabel': 'Code',
+      'preview.mdCodeWrap': 'Wrap',
+      'preview.mdCodeUnwrap': 'Unwrap',
+      'preview.mdFootnotes': 'Footnotes',
     }
 
     function makeT(t) {
@@ -2146,6 +2906,31 @@ window.__ModuleLoader__.load({
           XmindPreviewBody
         )
       })
+
+      // Right Sidebar document preview for `.md` / `.markdown`, rendered as a mindmap.
+      // `priority: 'extension'` outranks the host's builtin Markdown text preview, so this
+      // renders by default while the builtin stays selectable in the header dropdown.
+      // `bytes-complete` (not `text-pages`) because the whole document is needed for the
+      // tree: paged mode only loads the first page and the rest arrives on scroll.
+      ctx.effect(function () {
+        return ctx.documentPreviews.register({
+          id: MARKDOWN_PREVIEW_ID,
+          extensions: ['md', 'markdown'],
+          priority: 'extension',
+          title: function () {
+            return tr('preview.markdownTitle')
+          },
+          loading: 'bytes-complete',
+          wrap: false,
+        })
+      }, 'dsh-xmind-mindmap: markdown preview registration')
+
+      ctx.slots.inject('sidebar.right.tab.document', function () {
+        return ctx.slots.register(
+          { name: 'sidebar.right.tab.document', key: MARKDOWN_PREVIEW_ID, locale: LOCALE_NAMESPACE },
+          MarkdownPreviewBody
+        )
+      })
     }
 
     return {
@@ -2162,6 +2947,15 @@ window.__ModuleLoader__.load({
         countNodes: countNodes,
         TOOL_KEYS: TOOL_KEYS,
         PREVIEW_ID: PREVIEW_ID,
+        MARKDOWN_PREVIEW_ID: MARKDOWN_PREVIEW_ID,
+        MARKDOWN_MAX_BYTES: MARKDOWN_MAX_BYTES,
+        parseMarkdownText: parseMarkdownText,
+        markdownPreviewPayload: markdownPreviewPayload,
+        previewTextOf: previewTextOf,
+        previewDocumentText: previewDocumentText,
+        MarkdownPreviewBody: MarkdownPreviewBody,
+        MARKDOWN_VIEWS: MARKDOWN_VIEWS,
+        MindmapCard: MindmapCard,
         readZipEntries: readZipEntries,
         parseXmlLite: parseXmlLite,
         parseXmindBytes: parseXmindBytes,

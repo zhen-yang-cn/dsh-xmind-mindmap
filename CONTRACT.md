@@ -347,6 +347,9 @@ Common: all descriptions are concise English + one Chinese sentence. `timeoutMs:
 
 ### 5a. Right Sidebar document preview
 
+Two registrations share this slot; both bodies render the same `MindmapCard` with `variant: 'preview'`.
+
+**`.xmind` (bytes-complete)**
 - Register with `ctx.documentPreviews.register({ id: PREVIEW_ID, extensions: ['xmind'],
   binaryExtensions: ['xmind'], priority: 'extension', title: () => t('preview.title'),
   loading: 'bytes-complete', wrap: false })` inside `ctx.effect`.
@@ -354,8 +357,49 @@ Common: all descriptions are concise English + one Chinese sentence. `timeoutMs:
 - The body receives `{ content: { kind: 'bytes', data }, resourceAddress, t, ... }`; parse the bytes
   in the browser: ZIP via `DecompressionStream('deflate-raw')`, `content.json` first, else
   `content.xml`, into the same canonical tree and card payload. Multi-sheet files get a selector.
+
+**`.md` / `.markdown` (bytes-complete)**
+- Register with `ctx.documentPreviews.register({ id: MARKDOWN_PREVIEW_ID, extensions: ['md',
+  'markdown'], priority: 'extension', title: () => t('preview.markdownTitle'), loading:
+  'bytes-complete', wrap: false })` inside `ctx.effect`. No `binaryExtensions`: the suffix stays
+  readable text for the host.
+- `bytes-complete`, not `text-pages`: the host's paged mode loads page 1 and the rest only on
+  scroll, which cannot build a whole-document tree. The same loader as the `.xmind` preview is used.
+- `priority: 'extension'` ranks before the host's builtin Markdown renderer
+  (`rank = priority === 'builtin' ? 0 : 1`), so the mindmap is the default view while the builtin
+  text preview (which switches the pane back to `text-pages`) stays selectable in the header dropdown.
+- Register the body under `MARKDOWN_PREVIEW_ID`, locale `xmind`. It accepts both content shapes:
+  `{ kind: 'bytes', data }` (bytes-complete, decoded as UTF-8) and `{ kind: 'text', pages, text,
+  eof }` (text-pages), so a renderer switch does not blank the pane.
+- The body owns an in-pane view toggle, because both ways of reading the file were requested:
+  `preview.markdownViewMap` (导图 / Mindmap, the default) renders the `MindmapCard`, and
+  `preview.markdownViewSource` (原文 / Source) renders the file's own Markdown **as Markdown**.
+  `MARKDOWN_VIEWS = { MAP: 'map', SOURCE: 'source' }`; the view bar is a `role="toolbar"`
+  with two `aria-pressed` buttons (`aria-label` = the locale labels) that stay mounted in both views
+  so switching back never requires leaving the pane. The choice is kept per document path in the
+  module-level `MARKDOWN_VIEW_MEMORY` map (cleared past 50 paths), so a remounted panel returns to the
+  last view; no storage API is used (the read-only test forbids `localStorage`).
+- The source view renders through the host primitive `MarkdownText` from the platform seed module
+  `@deepseek-ai/dsh-client-ui-primitives` (the same renderer the builtin `.md` preview uses), so the
+  「原文」 reading is real formatted Markdown rather than a raw dump. The request is made once at
+  factory time inside `try/catch` into `hostMarkdownText`; a host without that seed word, or a
+  renderer that throws (caught by the `HostMarkdownBoundary` error boundary), degrades to the verbatim
+  UTF-8 Markdown in a scrollable `<pre>` — the only other `require` besides `react`, and it must stay
+  optional so the card always loads. Code-block chrome and footnote labels are supplied from this
+  plugin's own dictionary (`preview.mdCodeCopy` / `mdCodeCopied` / `mdCodeLabel` / `mdCodeWrap` /
+  `mdCodeUnwrap` / `mdFootnotes`), one key per label, in both `zh` and `en`.
+- `client.js` may not import host modules, so `parseMarkdownText` is a verbatim mirror of
+  `parseMarkdown` in `lib/markdown.js`; `test/preview.test.js` cross-checks both on the same sources.
+  Any behaviour change must be applied to both files. (The optional seed-module `require` above is a
+  runtime lookup, not an import, so this rule still holds.)
+- Documents above `MARKDOWN_MAX_BYTES` (8 MiB) and empty/blank documents render readable Chinese
+  states instead of a tree. These states replace the pane before the view bar, since neither view can
+  be shown.
+
+**Shared**
 - Render the existing `MindmapCard` with `variant: 'preview'` (fills the pane, no card border).
-- Invalid workbooks and non-bytes content render readable Chinese states; never throw.
+- Invalid workbooks, unreadable content and non-matching loading modes render readable Chinese
+  states; never throw.
 
 ### 5b. Chat card
 

@@ -58,8 +58,15 @@ test('loader format: window.__ModuleLoader__.load with id and factory', function
   const loaded = harness.loadClient()
   assert.equal(loaded.id, 'dsh-xmind-mindmap')
   assert.equal(typeof loaded.factory, 'function')
-  assert.equal(loaded.requireCalls.length, 1)
-  assert.equal(loaded.requireCalls[0], 'react')
+  assert.equal(loaded.requireCalls[0], 'react', 'React is the first and mandatory dependency')
+  // The only other module the client may ask for is the platform Markdown primitive, and that
+  // request must be optional so the card still loads on a host that does not seed it.
+  const optional = loaded.requireCalls.slice(1)
+  assert.deepEqual(optional, ['@deepseek-ai/dsh-client-ui-primitives'])
+  assert.ok(
+    /try \{\s*\n\s*const hostPrimitives = require\('@deepseek-ai\/dsh-client-ui-primitives'\)/.test(loaded.source),
+    'the host primitive require must sit inside a try/catch'
+  )
   assert.equal(loaded.window.__moduleLoaderLoadCount, 1)
 
   const source = loaded.source
@@ -68,7 +75,8 @@ test('loader format: window.__ModuleLoader__.load with id and factory', function
   assert.ok(source.indexOf("id: 'dsh-xmind-mindmap'") >= 0, 'literal loader id')
   assert.ok(source.indexOf("const React = require('react')") >= 0, 'React comes from require("react")')
   assert.ok(source.indexOf('React.createElement') >= 0, 'must use React.createElement')
-  assert.equal(source.indexOf('@deepseek-ai/'), -1, 'no Harness client packages')
+  const harnessPackages = source.match(/@deepseek-ai\/[a-z0-9-]+/g) || []
+  assert.deepEqual(harnessPackages, ['@deepseek-ai/dsh-client-ui-primitives'], 'no Harness client packages beyond the optional Markdown primitive')
   assert.equal(source.indexOf('jsx'), -1, 'no JSX')
 })
 

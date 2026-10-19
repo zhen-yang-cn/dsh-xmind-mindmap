@@ -41,21 +41,36 @@ and for UIs without a client card. `output.presentationMeta` carries the full tr
 sheet metadata and warnings to the Web card through the persisted result `meta` field, so the model
 never receives a wall of JSON.
 
-## Right Sidebar `.xmind` preview
+## Right Sidebar previews (`.xmind` and `.md`)
 
-Open any `.xmind` from the Files sidebar (or click a `.xmind` path) and the right
-Sidebar renders it directly — no chat turn, no tool call:
+Open any `.xmind` or `.md` / `.markdown` from the Files sidebar (or click its path) and the
+right Sidebar renders it directly — no chat turn, no tool call:
 
-- registered with `ctx.documentPreviews.register({ extensions: ['xmind'],
+- `.xmind` is registered with `ctx.documentPreviews.register({ extensions: ['xmind'],
   binaryExtensions: ['xmind'], loading: 'bytes-complete', priority: 'extension' })`
   plus a body in the keyed `sidebar.right.tab.document` slot;
-- reads the workbook's bytes in the browser, unzips them with `DecompressionStream`
+- it reads the workbook's bytes in the browser, unzips them with `DecompressionStream`
   (`deflate-raw`), and parses `content.json` first, falling back to `content.xml`
   (XMind 8). The browser parser is tested against the host parser on both formats;
+- `.md` / `.markdown` is registered as a second implementation with
+  `loading: 'bytes-complete', priority: 'extension'`, so the mindmap view wins over the host's
+  builtin Markdown text preview while that one stays selectable in the header dropdown.
+  `bytes-complete` rather than the host's paged mode because a whole-document tree needs the
+  whole file; the body still accepts the `{ kind: 'text' }` shape, so switching renderers in
+  the dropdown never blanks the pane. The document is parsed into the same tree with a
+  browser-side mirror of `lib/markdown.js` (cross-checked against the host parser by the tests);
+- the `.md` pane itself has a 导图 / 原文 toggle, so both readings are one click apart without
+  opening the header dropdown: 导图 (the default) draws the mindmap, 原文 renders the file's own
+  Markdown through the platform's `MarkdownText` primitive — the same renderer the builtin
+  preview uses, so headings, lists, tables, code blocks and images look native. The primitive is
+  `require`d optionally inside `try/catch` (it is a platform seed module, not a package
+  dependency); where the host does not expose it, or if it ever throws, 原文 falls back to the
+  untouched Markdown in a scrollable `<pre>`. The chosen view is remembered per file path for the
+  session, so reopening a file returns to the last reading mode;
 - multiple sheets get a selector above the map; the map supports fit, zoom, pan,
   expand/collapse, 导图/大纲 and the node details panel with notes/href/labels;
 - unsupported or corrupt workbooks show a readable Chinese error instead of
-  "该格式文件暂时无法预览".
+  "该格式文件暂时无法预览"; blank Markdown and files above 8 MiB show a readable state too.
 
 ## The card
 

@@ -50,5 +50,5 @@
     "uninstall:profile": "node scripts/install-profile.mjs uninstall",
     "package": "node scripts/build-package.mjs"
   },
-  "license": "UNLICENSED"
+  "license": "MIT"
 }

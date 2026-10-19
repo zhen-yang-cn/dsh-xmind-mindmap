@@ -46,10 +46,14 @@ export function createReactStub(stateOverrides) {
 
 /**
  * Execute client.js in a vm sandbox with a fake module loader.
+ * @param {{stateOverrides?: object, modules?: Object<string, object>}} [options] `modules` seeds
+ *   optional modules the client may request; any id missing from it rejects the require, which is
+ *   how the real loader behaves for an id the platform does not seed.
  * @returns {{source: string, id: string, factory: Function, module: object, react: object, requireCalls: string[]}}
  */
 export function loadClient(options) {
   const opts = options || {}
+  const modules = opts.modules || {}
   const source = fs.readFileSync(CLIENT_PATH, 'utf8')
   const react = createReactStub(opts.stateOverrides)
   const requireCalls = []
@@ -67,6 +71,7 @@ export function loadClient(options) {
   const requireStub = function (id) {
     requireCalls.push(id)
     if (id === 'react') return react
+    if (Object.prototype.hasOwnProperty.call(modules, id)) return modules[id]
     throw new Error('unexpected require: ' + id)
   }
   // Evaluate in the host realm (not vm) so internals produce host-realm objects that deepEqual compares naturally.
