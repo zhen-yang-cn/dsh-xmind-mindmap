@@ -1,0 +1,10 @@
+Copyright (c) 2026 zhen-yang-cn. All rights reserved.
+
+This repository and its contents are proprietary and confidential.
+
+No permission is granted, expressly or by implication, to use, copy, modify,
+merge, publish, distribute, sublicense, or sell any part of this software or
+its documentation without prior written consent from the copyright holder.
+
+The only exception is test/support/vendor/, which contains third-party code
+published under its own license (see test/support/vendor/README.md).

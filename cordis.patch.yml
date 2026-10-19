@@ -1,0 +1,7 @@
+# Bundle patch layer for dsh-xmind-mindmap.
+# The row loads index.js (Host half: four tools through ctx.tools.register) and the
+# package's `dsh.client` declaration loads client.js (browser half: the mindmap card
+# registered into the keyed tool.call.toolview slot).
+- insert:
+    - id: xmind-mindmap
+      name: dsh-xmind-mindmap

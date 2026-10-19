@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "XMind 导图",
+    "description": "在聊天中直接查看 .xmind 导图，把 Markdown 转成树形导图或 .xmind，并支持节点级增量编辑。"
+  }
+}

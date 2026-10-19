@@ -1,0 +1,9 @@
+.install/
+test/.tmp/
+node_modules/
+*.log
+.verify/
+.shots/
+
+# Test-only vendored stubs: keep the suite runnable from a clean clone.
+!test/support/vendor/node_modules/

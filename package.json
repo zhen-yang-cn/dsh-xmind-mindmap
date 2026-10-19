@@ -1,0 +1,54 @@
+{
+  "name": "dsh-xmind-mindmap",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "XMind mindmap plugin for DeepSeek Harness: right-sidebar .xmind preview, Markdown<->tree conversion, incremental node editing, and read-only chat cards.",
+  "icon": "icon.svg",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "locale",
+    "icon.svg",
+    "cordis.patch.yml",
+    "scripts",
+    "demo",
+    "test",
+    "README.md",
+    "INSTALL.md",
+    "CONTRACT.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check index.js && node --check client.js && node --check scripts/install-profile.mjs",
+    "verify": "node scripts/install-profile.mjs verify",
+    "install:profile": "node scripts/install-profile.mjs apply",
+    "uninstall:profile": "node scripts/install-profile.mjs uninstall",
+    "package": "node scripts/build-package.mjs"
+  },
+  "license": "UNLICENSED"
+}
